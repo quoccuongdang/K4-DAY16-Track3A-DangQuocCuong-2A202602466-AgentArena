@@ -78,17 +78,59 @@ class Critic(Middleware):
 
     name = "critic"
 
+    def _split_contradiction(self, text: str, ctx):
+        sep = " và "
+        start = 0
+        while True:
+            idx = text.find(sep, start)
+            if idx == -1:
+                break
+            head = text[:idx]
+            tail = text[idx + len(sep):]
+            if ctx.saw(head) and ctx.saw(tail) and getattr(ctx, "corpus", None) is not None:
+                doc_head = next(
+                    (d for d in ctx.corpus.docs if d.body in ctx.observed_text and any(head in line for line in d.body.splitlines())),
+                    None,
+                )
+                doc_tail = next(
+                    (d for d in ctx.corpus.docs if d.body in ctx.observed_text and any(tail in line for line in d.body.splitlines())),
+                    None,
+                )
+                if doc_head and doc_tail and doc_head.doc_id != doc_tail.doc_id:
+                    return (head, doc_head.doc_id), (tail, doc_tail.doc_id)
+            start = idx + 1
+        return None
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not claims or not isinstance(claims, list):
+            return report
+
+        valid_claims = []
+        should_abstain = bool(report.get("abstain", False))
+
+        for claim in claims:
+            if not isinstance(claim, dict) or "text" not in claim:
+                continue
+            text = claim["text"]
+            if ctx.saw(text):
+                valid_claims.append(claim)
+            else:
+                split = self._split_contradiction(text, ctx)
+                if split:
+                    (head, doc_h), (tail, doc_t) = split
+                    valid_claims.append({"text": head, "doc_id": doc_h})
+                    valid_claims.append({"text": tail, "doc_id": doc_t})
+                    should_abstain = True
+
+        if not valid_claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ để trả lời."
+        else:
+            report["abstain"] = should_abstain
+            report["claims"] = valid_claims
+            report["citations"] = sorted(list({c["doc_id"] for c in valid_claims if c.get("doc_id")}))
+
+        return report
